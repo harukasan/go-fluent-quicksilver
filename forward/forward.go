@@ -52,7 +52,7 @@ func DefaultConfig() *Config {
 // A Client that forwards logs to fluentd.
 type Client struct {
 	conn   *Connection
-	buf    *Buffer
+	output *Output
 	cancel context.CancelFunc
 }
 
@@ -64,11 +64,13 @@ func NewClient(network, addr string, config *Config) (*Client, error) {
 		cancel()
 		return nil, err
 	}
-	buf := NewBuffer(ctx, conn, config)
+
+	buf := NewMemoryBuffer(config)
+	output := NewOutput(conn, buf, config)
 
 	return &Client{
 		conn:   conn,
-		buf:    buf,
+		output: output,
 		cancel: cancel,
 	}, nil
 }
@@ -84,11 +86,11 @@ func (c *Client) Post(tag string, value interface{}) error {
 	} else {
 		t = NewEventTime(time.Now())
 	}
-	return c.buf.Append(tag, Entry{t, value})
+	return c.output.Append(tag, Entry{t, value})
 }
 
 func (c *Client) PostWithTime(tag string, t time.Time, value interface{}) error {
-	return c.buf.Append(tag, Entry{NewEventTime(t), value})
+	return c.output.Append(tag, Entry{NewEventTime(t), value})
 }
 
 func (c *Client) Close() error {

@@ -29,12 +29,12 @@ func TestChunkID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decoded != id {
-		t.Fatal("invalid ID: %v", s)
+		t.Fatalf("invalid ID: %v", s)
 	}
 }
 
 func BenchmarkNewChunkID(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		forward.NewChunkID().String()
+		_ = forward.NewChunkID().String()
 	}
 }

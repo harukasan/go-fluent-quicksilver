@@ -16,10 +16,8 @@ package forward
 
 import (
 	"context"
-	"io"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/pkg/errors"
 )
@@ -51,40 +49,42 @@ import (
 //                                                     |
 //                                                     +-------> output
 //
-type Buffer struct {
-	rw       io.ReadWriteCloser
-	config   *Config
-	stage    map[string]*Chunk
-	queue    chan *Chunk
-	dequeued map[ChunkID]*Chunk
-	stageMu  sync.Mutex
-	pool     *chunkPool
-	closed   bool
-	shutdown bool
-	stat     BufferStat
+type Buffer interface {
+	Append(string, Entry) error
+	Enqueue() error
+	Dequeue(context.Context) <-chan *Chunk
+	Takeback(*Chunk) error
+	Purge(*Chunk) error
+	Stat() BufferStat
 }
 
-// NewBuffer creates a new buffer that writes chunks into the connection rw.
-func NewBuffer(ctx context.Context, output io.ReadWriteCloser, config *Config) *Buffer {
-	buffer := &Buffer{
-		rw:       output,
-		config:   config,
-		stage:    make(map[string]*Chunk),
-		queue:    make(chan *Chunk, config.BufferQueueLimit),
-		dequeued: make(map[ChunkID]*Chunk),
-		pool:     globalChunkPool,
+type MemoryBuffer struct {
+	config  *Config
+	stage   map[string]*Chunk
+	queue   chan *Chunk
+	stageMu sync.Mutex
+	pool    *chunkPool
+	closed  bool
+	stat    BufferStat
+}
+
+var _ Buffer = &MemoryBuffer{}
+
+// NewMemoryBuffer creates a memory buffer that writes chunks into the connection rw.
+func NewMemoryBuffer(config *Config) *MemoryBuffer {
+	buffer := &MemoryBuffer{
+		config: config,
+		stage:  make(map[string]*Chunk),
+		queue:  make(chan *Chunk, config.BufferQueueLimit),
+		pool:   globalChunkPool,
 	}
-	buffer.start(ctx)
 	return buffer
 }
 
 // Append appends an entry of a tag into the buffer.
-func (b *Buffer) Append(tag string, entry Entry) error {
+func (b *MemoryBuffer) Append(tag string, entry Entry) error {
 	b.stageMu.Lock()
 	defer b.stageMu.Unlock()
-	if b.shutdown {
-		return errors.New("buffer is shutting down")
-	}
 
 	// get the chunk
 	chunk, exist := b.stage[tag]
@@ -100,15 +100,11 @@ func (b *Buffer) Append(tag string, entry Entry) error {
 		}
 		chunk = b.newStageChunk(tag)
 	}
-
-	var err error
-	chunk.Entries, err = entry.MarshalMsg(chunk.Entries)
-	err = errors.Wrap(err, "marshal entry")
-	return err
+	return b.appendEntry(chunk, entry)
 }
 
 // NOTE: call in stage lock
-func (b *Buffer) newStageChunk(tag string) *Chunk {
+func (b *MemoryBuffer) newStageChunk(tag string) *Chunk {
 	chunk := b.pool.Get()
 	chunk.Tag = tag
 	b.stage[tag] = chunk
@@ -116,23 +112,28 @@ func (b *Buffer) newStageChunk(tag string) *Chunk {
 	return chunk
 }
 
-// Enqueue pushes the staged chunk into the write queue.
-func (b *Buffer) Enqueue(tag string) error {
+func (b *MemoryBuffer) appendEntry(chunk *Chunk, entry Entry) error {
+	var err error
+	chunk.Entries, err = entry.MarshalMsg(chunk.Entries)
+	return errors.Wrap(err, "failed to append an entry into a chunk")
+}
+
+// Enqueue pushes all staged chunks into the write queue.
+func (b *MemoryBuffer) Enqueue() error {
 	b.stageMu.Lock()
 	defer b.stageMu.Unlock()
 
-	if _, exist := b.stage[tag]; !exist {
-		return nil
-	}
-	err := b.enqueue(tag)
-	if err != nil {
-		return err
+	for tag := range b.stage {
+		err := b.enqueue(tag)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // NOTE: call in stage lock
-func (b *Buffer) enqueue(tag string) error {
+func (b *MemoryBuffer) enqueue(tag string) error {
 	b.queue <- b.stage[tag]
 	delete(b.stage, tag)
 	b.stat.incrQueue()
@@ -140,79 +141,37 @@ func (b *Buffer) enqueue(tag string) error {
 	return nil
 }
 
-func (b *Buffer) start(ctx context.Context) {
-	go b.writeLoop(ctx)
-	go b.flushLoop(ctx)
-}
-
-func (b *Buffer) writeLoop(ctx context.Context) {
-	buf := make([]byte, b.config.BufferChunkLimit)
-	retryInterval := b.config.RetryInterval
-	for {
-		var chunk *Chunk
-		select {
-		case <-ctx.Done():
-			return
-		case chunk = <-b.queue:
-		}
-		b.stat.decrQueue()
-		err := b.write(chunk, buf)
-		if err != nil {
-			b.queue <- chunk
-
-			// wait for retry
+func (b *MemoryBuffer) Dequeue(ctx context.Context) <-chan *Chunk {
+	ch := make(chan *Chunk)
+	go func(queue <-chan *Chunk, out <-chan *Chunk) {
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(retryInterval):
+			case chunk := <-b.queue:
+				ch <- chunk
+				b.stat.decrQueue()
+				b.stat.incrDequeued()
 			}
-			retryInterval = retryInterval * 2
-			if retryInterval > b.config.MaxRetryInterval {
-				retryInterval = b.config.MaxRetryInterval
-			}
-			continue
 		}
-		retryInterval = b.config.RetryInterval
-	}
+	}(b.queue, ch)
+	return ch
 }
 
-// NOTE: call in queue block
-func (b *Buffer) write(chunk *Chunk, buf []byte) error {
-	var err error
-	buf, err = chunk.MarshalMsg(buf[:0])
-	if err != nil {
-		return errors.Wrap(err, "failed to marshal")
-	}
-	_, err = b.rw.Write(buf)
-	if err != nil {
-		return err
-	}
+func (b *MemoryBuffer) Purge(chunk *Chunk) error {
+	b.stat.decrDequeued()
 	b.pool.Put(chunk)
 	return nil
 }
 
-func (b *Buffer) flushLoop(ctx context.Context) {
-	t := time.NewTicker(b.config.FlushInterval)
-	for {
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-		}
-		b.stageMu.Lock()
-		for tag := range b.stage {
-			err := b.enqueue(tag)
-			if err != nil {
-				continue
-			}
-		}
-		b.stageMu.Unlock()
-	}
+func (b *MemoryBuffer) Takeback(chunk *Chunk) error {
+	b.queue <- chunk
+	b.stat.incrQueue()
+	return nil
 }
 
 // Stat returns buffer statistics instant.
-func (b *Buffer) Stat() BufferStat {
+func (b *MemoryBuffer) Stat() BufferStat {
 	return b.stat.clone()
 }
 
